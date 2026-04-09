@@ -359,6 +359,7 @@ const ADD_PHONE_PAGE_PATTERN = /add[\s-]*phone|添加手机号|手机号码|手�
 const STEP5_SUBMIT_ERROR_PATTERN = /无法根据该信息创建帐户|请重试|unable\s+to\s+create\s+(?:your\s+)?account|couldn'?t\s+create\s+(?:your\s+)?account|something\s+went\s+wrong|invalid\s+(?:birthday|birth|date)|生日|出生日期/i;
 const SIGNUP_PASSWORD_ERROR_TITLE_PATTERN = /糟糕，出错了|something\s+went\s+wrong|oops/i;
 const SIGNUP_PASSWORD_ERROR_DETAIL_PATTERN = /operation\s+timed\s+out|timed\s+out|请求超时|操作超时/i;
+const SIGNUP_EMAIL_EXISTS_PATTERN = /与此电子邮件地址相关联的帐户已存在|account\s+associated\s+with\s+this\s+email\s+address\s+already\s+exists|email\s+address.*already\s+exists/i;
 
 function getVerificationErrorText() {
   const messages = [];
@@ -609,6 +610,10 @@ function isSignupPasswordErrorPage() {
   );
 }
 
+function isSignupEmailAlreadyExistsPage() {
+  return isSignupPasswordPage() && SIGNUP_EMAIL_EXISTS_PATTERN.test(getPageTextSnapshot());
+}
+
 function inspectSignupVerificationState() {
   if (isStep5Ready()) {
     return { state: 'step5' };
@@ -623,6 +628,10 @@ function inspectSignupVerificationState() {
       state: 'error',
       retryButton: getSignupRetryButton(),
     };
+  }
+
+  if (isSignupEmailAlreadyExistsPage()) {
+    return { state: 'email_exists' };
   }
 
   const passwordInput = getSignupPasswordInput();
@@ -644,7 +653,7 @@ async function waitForSignupVerificationTransition(timeout = 5000) {
     throwIfStopped();
 
     const snapshot = inspectSignupVerificationState();
-    if (snapshot.state === 'step5' || snapshot.state === 'verification' || snapshot.state === 'error') {
+    if (snapshot.state === 'step5' || snapshot.state === 'verification' || snapshot.state === 'error' || snapshot.state === 'email_exists') {
       return snapshot;
     }
 
@@ -675,6 +684,10 @@ async function prepareSignupVerificationFlow(payload = {}, timeout = 30000) {
     if (snapshot.state === 'verification') {
       log(`步骤 4：验证码页面已就绪${recoveryRound ? `（期间自动恢复 ${recoveryRound} 次）` : ''}。`, 'ok');
       return { ready: true, retried: recoveryRound };
+    }
+
+    if (snapshot.state === 'email_exists') {
+      throw new Error('当前邮箱已存在，需要重新开始新一轮。');
     }
 
     recoveryRound += 1;

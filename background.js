@@ -603,6 +603,11 @@ function isRetryableContentScriptTransportError(error) {
   return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response/i.test(message);
 }
 
+function isRestartCurrentAttemptError(error) {
+  const message = String(typeof error === 'string' ? error : error?.message || '');
+  return /当前邮箱已存在，需要重新开始新一轮/.test(message);
+}
+
 function isStepDoneStatus(status) {
   return status === 'completed' || status === 'manual_completed' || status === 'skipped';
 }
@@ -1297,7 +1302,8 @@ async function autoRunLoop(totalRuns, options = {}) {
   const resumeCurrentRun = Number.isInteger(options.resumeCurrentRun) ? options.resumeCurrentRun : 0;
   const resumeSuccessfulRuns = Number.isInteger(options.resumeSuccessfulRuns) ? options.resumeSuccessfulRuns : 0;
   const resumeAttemptRunsProcessed = Number.isInteger(options.resumeAttemptRunsProcessed) ? options.resumeAttemptRunsProcessed : 0;
-  const maxAttempts = autoRunSkipFailures ? Math.max(totalRuns * 10, totalRuns + 20) : totalRuns;
+  let maxAttempts = autoRunSkipFailures ? Math.max(totalRuns * 10, totalRuns + 20) : totalRuns;
+  const forcedRetryCap = Math.max(totalRuns * 10, totalRuns + 20);
   let successfulRuns = Math.max(0, resumeSuccessfulRuns);
   let attemptRuns = Math.max(0, resumeAttemptRunsProcessed);
   let forceFreshTabsNextRun = false;
@@ -1390,6 +1396,20 @@ async function autoRunLoop(totalRuns, options = {}) {
           attemptRun: attemptRuns,
         });
         break;
+      }
+
+      if (isRestartCurrentAttemptError(err)) {
+        await addLog(`目标 ${targetRun}/${totalRuns} 轮检测到当前邮箱已存在，当前线程已放弃，将重新开始新一轮。`, 'warn');
+        cancelPendingCommands('当前线程因邮箱已存在而放弃。');
+        await broadcastStopToContentScripts();
+        await broadcastAutoRunStatus('retrying', {
+          currentRun: targetRun,
+          totalRuns,
+          attemptRun: attemptRuns,
+        });
+        forceFreshTabsNextRun = true;
+        maxAttempts = Math.max(maxAttempts, Math.min(forcedRetryCap, attemptRuns + 1));
+        continue;
       }
 
       if (!autoRunSkipFailures) {
