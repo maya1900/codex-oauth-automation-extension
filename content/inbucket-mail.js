@@ -136,7 +136,10 @@ function getCurrentMailboxIds() {
 }
 
 async function refreshMailbox() {
-  const refreshButton = document.querySelector('button[alt="Refresh Mailbox"]');
+  const refreshButton = document.querySelector('button[alt="Refresh Mailbox"]')
+    || Array.from(document.querySelectorAll('.message-list-controls button')).find((button) => {
+      return button.querySelector('.fa-sync');
+    });
   if (!refreshButton) return;
 
   simulateClick(refreshButton);
@@ -172,6 +175,8 @@ async function handleMailboxPollEmail(step, payload) {
     maxAttempts = 20,
     intervalMs = 3000,
     excludeCodes = [],
+    initialRefreshFirst = false,
+    initialRefreshDelayMs = 2000,
   } = payload || {};
   const excludedCodeSet = new Set(excludeCodes.filter(Boolean));
 
@@ -192,7 +197,11 @@ async function handleMailboxPollEmail(step, payload) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     log(`步骤 ${step}：正在轮询 Inbucket 邮箱，第 ${attempt}/${maxAttempts} 次`);
 
-    if (attempt > 1) {
+    if (attempt === 1 && initialRefreshFirst) {
+      log(`步骤 ${step}：先等待 ${Math.round(initialRefreshDelayMs / 1000)} 秒，再主动刷新邮箱检查新邮件...`);
+      await sleep(initialRefreshDelayMs);
+      await refreshMailbox();
+    } else if (attempt > 1) {
       await refreshMailbox();
     }
 

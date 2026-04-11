@@ -210,6 +210,37 @@ async function getTabId(source) {
   return registry[source]?.tabId || null;
 }
 
+async function activateTabWithRetry(tabId, options = {}) {
+  const {
+    retries = 3,
+    delayMs = 400,
+    logLabel = '',
+  } = options;
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await chrome.tabs.update(tabId, { active: true });
+      return;
+    } catch (err) {
+      lastError = err;
+      const message = err?.message || String(err);
+      const isTabBusyError = /Tabs cannot be edited right now/i.test(message);
+      if (!isTabBusyError || attempt >= retries) {
+        throw err;
+      }
+
+      if (logLabel) {
+        await addLog(`${logLabel}：标签页暂时不可切换，正在重试（${attempt + 1}/${retries}）...`, 'warn');
+      }
+      await sleepWithStop(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
 function parseUrlSafely(rawUrl) {
   if (!rawUrl) return null;
   try {
@@ -608,6 +639,39 @@ async function reuseOrCreateTab(source, url, options = {}) {
 
   await rememberSourceLastUrl(source, url);
   return tab.id;
+}
+
+async function focusMailTabForVerification(mail, step) {
+  const logLabel = `步骤 ${step}`;
+  let tabId = null;
+
+  const alive = await isTabAlive(mail.source);
+  if (alive) {
+    if (mail.navigateOnReuse) {
+      tabId = await reuseOrCreateTab(mail.source, mail.url, {
+        inject: mail.inject,
+        injectSource: mail.injectSource,
+      });
+    } else {
+      tabId = await getTabId(mail.source);
+      await activateTabWithRetry(tabId, { logLabel });
+    }
+  } else {
+    tabId = await reuseOrCreateTab(mail.source, mail.url, {
+      inject: mail.inject,
+      injectSource: mail.injectSource,
+    });
+  }
+
+  if (Number.isInteger(tabId) && mail.inject?.length) {
+    await ensureContentScriptReadyOnTab(mail.source, tabId, {
+      inject: mail.inject,
+      injectSource: mail.injectSource,
+      timeoutMs: 20000,
+      retryDelayMs: 700,
+      logMessage: `${logLabel}：正在等待${mail.label}内容脚本重新就绪...`,
+    });
+  }
 }
 
 // ============================================================
@@ -2014,7 +2078,7 @@ async function requestVerificationCodeResend(step) {
     throw new Error('认证页面标签页已关闭，无法重新请求验证码。');
   }
 
-  await chrome.tabs.update(signupTabId, { active: true });
+  await activateTabWithRetry(signupTabId, { logLabel: `步骤 ${step}` });
   await addLog(`步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
 
   const result = await sendToContentScript('signup-page', {
@@ -2048,6 +2112,7 @@ async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) 
   for (let round = 1; round <= maxRounds; round++) {
     if (round > 1) {
       await requestVerificationCodeResend(step);
+      await focusMailTabForVerification(mail, step);
     }
 
     const payload = getVerificationPollPayload(step, state, {
@@ -2102,7 +2167,7 @@ async function submitVerificationCode(step, code) {
     throw new Error('认证页面标签页已关闭，无法填写验证码。');
   }
 
-  await chrome.tabs.update(signupTabId, { active: true });
+  await activateTabWithRetry(signupTabId, { logLabel: `步骤 ${step}` });
   const result = await sendToContentScript('signup-page', {
     type: 'FILL_CODE',
     step,
@@ -2126,11 +2191,16 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
 
   const nextFilterAfterTimestamp = options.filterAfterTimestamp ?? null;
   const requestFreshCodeFirst = Boolean(options.requestFreshCodeFirst);
+  const initialMailboxRefreshFirst = Boolean(options.initialMailboxRefreshFirst);
+  const initialMailboxRefreshDelayMs = Number(options.initialMailboxRefreshDelayMs) > 0
+    ? Number(options.initialMailboxRefreshDelayMs)
+    : 2000;
   const maxSubmitAttempts = 3;
 
   if (requestFreshCodeFirst) {
     try {
       await requestVerificationCodeResend(step);
+      await focusMailTabForVerification(mail, step);
       await addLog(`步骤 ${step}：已先请求一封新的${getVerificationCodeLabel(step)}验证码，再开始轮询邮箱。`, 'warn');
     } catch (err) {
       await addLog(`步骤 ${step}：首次重新获取验证码失败：${err.message}，将继续使用当前时间窗口轮询。`, 'warn');
@@ -2141,6 +2211,8 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
     const result = await pollFreshVerificationCode(step, state, mail, {
       excludeCodes: [...rejectedCodes],
       filterAfterTimestamp: nextFilterAfterTimestamp ?? undefined,
+      initialRefreshFirst: initialMailboxRefreshFirst && attempt === 1,
+      initialRefreshDelayMs: initialMailboxRefreshDelayMs,
     });
 
     await addLog(`步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
@@ -2155,6 +2227,7 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
       }
 
       await requestVerificationCodeResend(step);
+      await focusMailTabForVerification(mail, step);
       await addLog(`步骤 ${step}：提交失败后已请求新验证码（${attempt + 1}/${maxSubmitAttempts}）...`, 'warn');
       continue;
     }
@@ -2181,7 +2254,7 @@ async function executeStep4(state) {
     throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
   }
 
-  await chrome.tabs.update(signupTabId, { active: true });
+  await activateTabWithRetry(signupTabId, { logLabel: '步骤 4' });
   await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
   const prepareResult = await sendToContentScriptResilient(
     'signup-page',
@@ -2207,29 +2280,12 @@ async function executeStep4(state) {
   }
 
   await addLog(`步骤 4：正在打开${mail.label}...`);
-
-  // For mail tabs, only create if not alive — don't navigate (preserves login session)
-  const alive = await isTabAlive(mail.source);
-  if (alive) {
-    if (mail.navigateOnReuse) {
-      await reuseOrCreateTab(mail.source, mail.url, {
-        inject: mail.inject,
-        injectSource: mail.injectSource,
-      });
-    } else {
-      const tabId = await getTabId(mail.source);
-      await chrome.tabs.update(tabId, { active: true });
-    }
-  } else {
-    await reuseOrCreateTab(mail.source, mail.url, {
-      inject: mail.inject,
-      injectSource: mail.injectSource,
-    });
-  }
+  await focusMailTabForVerification(mail, 4);
 
   await resolveVerificationStep(4, state, mail, {
     filterAfterTimestamp: stepStartedAt,
-    requestFreshCodeFirst: true,
+    initialMailboxRefreshFirst: mail.source === 'inbucket-mail',
+    initialMailboxRefreshDelayMs: 2000,
   });
   return;
 }
@@ -2305,7 +2361,7 @@ async function runStep7Attempt(state) {
   const authTabId = await getTabId('signup-page');
 
   if (authTabId) {
-    await chrome.tabs.update(authTabId, { active: true });
+    await activateTabWithRetry(authTabId, { logLabel: '步骤 7' });
   } else {
     if (!state.oauthUrl) {
       throw new Error('缺少 OAuth 链接，请先完成步骤 1。');
@@ -2326,24 +2382,7 @@ async function runStep7Attempt(state) {
   }
 
   await addLog(`步骤 7：正在打开${mail.label}...`);
-
-  const alive = await isTabAlive(mail.source);
-  if (alive) {
-    if (mail.navigateOnReuse) {
-      await reuseOrCreateTab(mail.source, mail.url, {
-        inject: mail.inject,
-        injectSource: mail.injectSource,
-      });
-    } else {
-      const tabId = await getTabId(mail.source);
-      await chrome.tabs.update(tabId, { active: true });
-    }
-  } else {
-    await reuseOrCreateTab(mail.source, mail.url, {
-      inject: mail.inject,
-      injectSource: mail.injectSource,
-    });
-  }
+  await focusMailTabForVerification(mail, 7);
 
   await resolveVerificationStep(7, state, mail, {
     filterAfterTimestamp: stepStartedAt,
