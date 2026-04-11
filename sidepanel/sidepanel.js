@@ -657,7 +657,10 @@ async function fetchDuckEmail(options = {}) {
     const response = await chrome.runtime.sendMessage({
       type: 'FETCH_DUCK_EMAIL',
       source: 'sidepanel',
-      payload: { generateNew: true },
+      payload: {
+        generateNew: true,
+        returnToSignupPageOnSuccess: true,
+      },
     });
 
     if (response?.error) {
@@ -774,7 +777,10 @@ document.querySelectorAll('.step-btn').forEach(btn => {
         let email = inputEmail.value.trim();
         if (!email) {
           try {
-            email = await fetchDuckEmail({ showFailureToast: false });
+            email = await fetchDuckEmail({
+              showFailureToast: false,
+              returnToSignupPageOnSuccess: true,
+            });
           } catch (err) {
             showToast(`自动获取失败：${err.message}，请手动粘贴邮箱后重试。`, 'warn');
             return;

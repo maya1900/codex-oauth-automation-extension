@@ -1496,7 +1496,10 @@ async function executeStepAndWait(step, delayAfter = 2000) {
 
 async function fetchDuckEmail(options = {}) {
   throwIfStopped();
-  const { generateNew = true } = options;
+  const {
+    generateNew = true,
+    returnToSignupPageOnSuccess = true,
+  } = options;
 
   await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
   await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
@@ -1515,6 +1518,18 @@ async function fetchDuckEmail(options = {}) {
   }
 
   await setEmailState(result.email);
+
+  if (returnToSignupPageOnSuccess) {
+    const signupTabId = await getTabId('signup-page');
+    if (signupTabId) {
+      try {
+        await activateTabWithRetry(signupTabId, { logLabel: 'Duck 邮箱' });
+      } catch (err) {
+        console.warn(LOG_PREFIX, 'Failed to return to signup page after duck email fetch:', err?.message || err);
+      }
+    }
+  }
+
   await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
   return result.email;
 }
@@ -1572,7 +1587,10 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
       if (duckAttempt > 1) {
         await addLog(`Duck 邮箱：正在进行第 ${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
       }
-      const duckEmail = await fetchDuckEmail({ generateNew: true });
+      const duckEmail = await fetchDuckEmail({
+        generateNew: true,
+        returnToSignupPageOnSuccess: true,
+      });
       await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：Duck 邮箱已就绪：${duckEmail}（第 ${attemptRuns} 次尝试，Duck 第 ${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次获取）===`, 'ok');
       return duckEmail;
     } catch (err) {
