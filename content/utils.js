@@ -1,5 +1,7 @@
 // content/utils.js — Shared utilities for all content scripts
 
+const getActivationStrategy = self.MultiPageActivationUtils?.getActivationStrategy;
+
 const SCRIPT_SOURCE = (() => {
   if (window.__MULTIPAGE_SOURCE) return window.__MULTIPAGE_SOURCE;
   const url = location.href;
@@ -256,13 +258,20 @@ function log(message, level = 'info') {
  */
 function reportReady() {
   console.log(LOG_PREFIX, '内容脚本已就绪');
-  chrome.runtime.sendMessage({
+  const message = {
     type: 'CONTENT_SCRIPT_READY',
     source: SCRIPT_SOURCE,
     step: null,
     payload: {},
     error: null,
-  });
+  };
+  Promise.resolve(chrome.runtime.sendMessage(message))
+    .then((response) => {
+      console.log(LOG_PREFIX, 'CONTENT_SCRIPT_READY sent successfully', { response, url: location.href });
+    })
+    .catch((err) => {
+      console.error(LOG_PREFIX, 'CONTENT_SCRIPT_READY send failed', err?.message || err, { url: location.href });
+    });
 }
 
 /**
@@ -273,13 +282,27 @@ function reportReady() {
 function reportComplete(step, data = {}) {
   console.log(LOG_PREFIX, `步骤 ${step} 已完成`, data);
   log(`步骤 ${step} 已成功完成`, 'ok');
-  chrome.runtime.sendMessage({
+  const message = {
     type: 'STEP_COMPLETE',
     source: SCRIPT_SOURCE,
     step,
     payload: data,
     error: null,
-  });
+  };
+  Promise.resolve(chrome.runtime.sendMessage(message))
+    .then((response) => {
+      console.log(LOG_PREFIX, `STEP_COMPLETE sent successfully for step ${step}`, {
+        response,
+        url: location.href,
+        payloadKeys: Object.keys(data || {}),
+      });
+    })
+    .catch((err) => {
+      console.error(LOG_PREFIX, `STEP_COMPLETE send failed for step ${step}`, err?.message || err, {
+        url: location.href,
+        payloadKeys: Object.keys(data || {}),
+      });
+    });
 }
 
 /**
@@ -290,13 +313,27 @@ function reportComplete(step, data = {}) {
 function reportError(step, errorMessage) {
   console.error(LOG_PREFIX, `步骤 ${step} 失败: ${errorMessage}`);
   log(`步骤 ${step} 失败：${errorMessage}`, 'error');
-  chrome.runtime.sendMessage({
+  const message = {
     type: 'STEP_ERROR',
     source: SCRIPT_SOURCE,
     step,
     payload: {},
     error: errorMessage,
-  });
+  };
+  Promise.resolve(chrome.runtime.sendMessage(message))
+    .then((response) => {
+      console.log(LOG_PREFIX, `STEP_ERROR sent successfully for step ${step}`, {
+        response,
+        url: location.href,
+        errorMessage,
+      });
+    })
+    .catch((err) => {
+      console.error(LOG_PREFIX, `STEP_ERROR send failed for step ${step}`, err?.message || err, {
+        url: location.href,
+        errorMessage,
+      });
+    });
 }
 
 /**
@@ -305,9 +342,34 @@ function reportError(step, errorMessage) {
  */
 function simulateClick(el) {
   throwIfStopped();
-  el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-  console.log(LOG_PREFIX, `已点击: ${el.tagName} ${el.textContent?.slice(0, 30) || ''}`);
-  log(`已点击 [${el.tagName}] "${el.textContent?.trim().slice(0, 30) || ''}"`);
+  if (!el) {
+    throw new Error('无法点击空元素。');
+  }
+
+  const form = el.form || el.closest?.('form') || null;
+  const strategy = typeof getActivationStrategy === 'function'
+    ? getActivationStrategy({
+      tagName: el.tagName,
+      type: el.getAttribute?.('type') || el.type || '',
+      hasForm: Boolean(form),
+      pathname: location.pathname || '',
+    })
+    : { method: 'click' };
+
+  let method = strategy.method || 'click';
+
+  if (method === 'requestSubmit' && form && typeof form.requestSubmit === 'function') {
+    form.requestSubmit(el);
+  } else if (typeof el.click === 'function') {
+    method = 'click';
+    el.click();
+  } else {
+    method = 'dispatchEvent';
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  }
+
+  console.log(LOG_PREFIX, `已点击(${method}): ${el.tagName} ${el.textContent?.slice(0, 30) || ''}`);
+  log(`已点击(${method}) [${el.tagName}] "${el.textContent?.trim().slice(0, 30) || ''}"`);
 }
 
 /**
