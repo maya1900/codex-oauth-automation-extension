@@ -769,6 +769,7 @@ async function refreshHotmailAccessToken(account) {
   formData.set('grant_type', 'refresh_token');
   formData.set('refresh_token', account.refreshToken);
   formData.set('scope', scopes.join(' '));
+  formData.set('redirect_uri', 'https://login.microsoftonline.com/common/oauth2/nativeclient');
 
   let response;
   try {
@@ -801,7 +802,11 @@ async function refreshHotmailAccessToken(account) {
   }
 
   if (!response.ok || !payload?.access_token) {
-    const errorText = payload?.error_description || payload?.error?.message || payload?.error || payload?.message || text || `HTTP ${response.status}`;
+    const rawErrorText = payload?.error_description || payload?.error?.message || payload?.error || payload?.message || text || `HTTP ${response.status}`;
+    const isCrossOriginError = typeof rawErrorText === 'string' && rawErrorText.includes('AADSTS90023');
+    const errorText = isCrossOriginError
+      ? `Azure AD 拒绝了跨域令牌请求（AADSTS90023）。请在 Azure AD 应用注册中将应用平台改为"单页应用程序（SPA）"，并将重定向 URI 设置为 https://login.microsoftonline.com/common/oauth2/nativeclient，或将应用类型改为"移动和桌面应用程序（Native）"。`
+      : rawErrorText;
     const error = new Error(`Hotmail 令牌刷新失败：${errorText}`);
     error.code = 'HOTMAIL_TOKEN_REFRESH_FAILED';
     throw error;
@@ -1294,6 +1299,37 @@ async function closeLocalhostCallbackTabs(callbackUrl, options = {}) {
   return matchedIds.length;
 }
 
+function buildLocalhostCleanupPrefix(rawUrl) {
+  if (!isLocalhostOAuthCallbackUrl(rawUrl)) return '';
+  const parsed = parseUrlSafely(rawUrl);
+  if (!parsed) return '';
+
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  if (!segments.length) {
+    return parsed.origin;
+  }
+
+  return `${parsed.origin}/${segments[0]}`;
+}
+
+async function closeTabsByUrlPrefix(prefix, options = {}) {
+  if (!prefix) return 0;
+
+  const { excludeTabIds = [] } = options;
+  const excluded = new Set(excludeTabIds.filter(id => Number.isInteger(id)));
+  const tabs = await chrome.tabs.query({});
+  const matchedIds = tabs
+    .filter((tab) => Number.isInteger(tab.id) && !excluded.has(tab.id))
+    .filter((tab) => typeof tab.url === 'string' && tab.url.startsWith(prefix))
+    .map((tab) => tab.id);
+
+  if (!matchedIds.length) return 0;
+
+  await chrome.tabs.remove(matchedIds).catch(() => { });
+  await addLog(`已关闭 ${matchedIds.length} 个匹配 ${prefix} 的 localhost 残留标签页。`, 'info');
+  return matchedIds.length;
+}
+
 async function pingContentScriptOnTab(tabId) {
   if (!Number.isInteger(tabId)) return null;
 
@@ -1740,23 +1776,27 @@ async function focusMailTabForVerification(mail, step) {
 // ============================================================
 
 async function sendToContentScript(source, message, options = {}) {
+  throwIfStopped();
   const { responseTimeoutMs = getContentScriptResponseTimeoutMs(message) } = options;
   const registry = await getTabRegistry();
   const entry = registry[source];
 
   if (!entry || !entry.ready) {
+    throwIfStopped();
     console.log(LOG_PREFIX, `${source} not ready, queuing command`);
     return queueCommand(source, message);
   }
 
   // Verify tab is still alive
   const alive = await isTabAlive(source);
+  throwIfStopped();
   if (!alive) {
     // Tab was closed — queue the command, it will be sent when tab is reopened
     console.log(LOG_PREFIX, `${source} tab was closed, queuing command`);
     return queueCommand(source, message);
   }
 
+  throwIfStopped();
   console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, message.type);
   return sendTabMessageWithTimeout(entry.tabId, source, message, responseTimeoutMs);
 }
@@ -3857,13 +3897,17 @@ function getVerificationPollPayload(step, state, overrides = {}) {
 }
 
 async function requestVerificationCodeResend(step) {
+  throwIfStopped();
   const signupTabId = await getTabId('signup-page');
   if (!signupTabId) {
     throw new Error('认证页面标签页已关闭，无法重新请求验证码。');
   }
 
-  await activateTabWithRetry(signupTabId, { logLabel: `步骤 ${step}` });
+  throwIfStopped();
+  await chrome.tabs.update(signupTabId, { active: true });
+  throwIfStopped();
   await addLog(`步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
+  throwIfStopped();
 
   const result = await sendToContentScript('signup-page', {
     type: 'RESEND_VERIFICATION_CODE',
@@ -3910,6 +3954,7 @@ async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) 
   const maxRounds = pollOverrides.maxRounds || VERIFICATION_POLL_MAX_ROUNDS;
 
   for (let round = 1; round <= maxRounds; round++) {
+    throwIfStopped();
     if (round > 1) {
       await requestVerificationCodeResend(step);
       await focusMailTabForVerification(mail, step);
@@ -3950,6 +3995,9 @@ async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) 
 
       return result;
     } catch (err) {
+      if (isStopError(err)) {
+        throw err;
+      }
       lastError = err;
       await addLog(`步骤 ${step}：${err.message}`, 'warn');
       if (round < maxRounds) {
@@ -4016,7 +4064,7 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
       await focusMailTabForVerification(mail, step);
       await addLog(`步骤 ${step}：已先请求一封新的${getVerificationCodeLabel(step)}验证码，再开始轮询邮箱。`, 'warn');
     } catch (err) {
-      if (step === 7 && isStep7RestartFromStep6Error(err)) {
+      if (isStopError(err) || (step === 7 && isStep7RestartFromStep6Error(err))) {
         throw err;
       }
       await addLog(`步骤 ${step}：首次重新获取验证码失败：${err.message}，将继续使用当前时间窗口轮询。`, 'warn');
@@ -4039,7 +4087,9 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
       initialRefreshDelayMs: initialMailboxRefreshDelayMs,
     });
 
+    throwIfStopped();
     await addLog(`步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
+    throwIfStopped();
     const submitResult = await submitVerificationCode(step, result.code);
 
     if (submitResult.invalidCode) {
@@ -4078,7 +4128,8 @@ async function executeStep4(state) {
     throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
   }
 
-  await activateTabWithRetry(signupTabId, { logLabel: '步骤 4' });
+  await chrome.tabs.update(signupTabId, { active: true });
+  throwIfStopped();
   await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
   const prepareResult = await sendToContentScriptResilient(
     'signup-page',
@@ -4106,6 +4157,7 @@ async function executeStep4(state) {
     return;
   }
 
+  throwIfStopped();
   if (mail.provider === HOTMAIL_PROVIDER) {
     await addLog(`步骤 4：正在通过 ${mail.label} 轮询验证码...`);
   } else {
@@ -4201,6 +4253,7 @@ async function runStep7Attempt(state) {
     await reuseOrCreateTab('signup-page', state.oauthUrl);
   }
 
+  throwIfStopped();
   await addLog('步骤 7：正在准备认证页，必要时切换到一次性验证码登录...');
   const prepareResult = await sendToContentScript('signup-page', {
     type: 'PREPARE_LOGIN_CODE',
@@ -4218,6 +4271,7 @@ async function runStep7Attempt(state) {
     throw new Error(prepareResult.error);
   }
 
+  throwIfStopped();
   if (mail.provider === HOTMAIL_PROVIDER) {
     await addLog(`步骤 7：正在通过 ${mail.label} 轮询验证码...`);
   } else {
